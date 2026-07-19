@@ -84,22 +84,25 @@ pub fn validate_vec_contact(value: &[String]) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Strict grant-type validation for admin- and bootstrap-managed clients
+/// (dynamic client registration, `UpdateClientRequest`, bootstrap config): the advertised
+/// grant types are stored verbatim as the client's enabled flows, so an unknown/unsupported
+/// one is rejected up front rather than silently persisted as a dead flow. The single
+/// exception is the ephemeral (CIMD) path, which can opt into stripping unknown grant types
+/// via `ephemeral_clients.ignore_unknown_auth_flows` (see `Client::ephemeral_from_url`).
 #[inline]
 pub fn validate_vec_grant_types(value: &[String]) -> Result<(), ValidationError> {
-    let mut err = None;
-
     if value.is_empty() {
-        err = Some("'flows_enabled' cannot be empty when provided");
-    } else {
-        value.iter().for_each(|v| {
-            if !RE_GRANT_TYPES.is_match(v) {
-                err = Some("^(authorization_code|client_credentials|urn:ietf:params:oauth:grant-type:device_code|password|refresh_token)$");
-            }
-        });
+        return Err(ValidationError::new(
+            "'flows_enabled' cannot be empty when provided",
+        ));
     }
-
-    if let Some(e) = err {
-        return Err(ValidationError::new(e));
+    for v in value {
+        if !RE_GRANT_TYPES.is_match(v) {
+            return Err(ValidationError::new(
+                "^(authorization_code|client_credentials|urn:ietf:params:oauth:grant-type:device_code|password|refresh_token)$",
+            ));
+        }
     }
     Ok(())
 }
@@ -148,16 +151,19 @@ pub fn validate_vec_uri(value: &[String]) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Grant-type validation for ephemeral (CIMD) client documents. Strict by default: an
+/// advertised grant type Rauthy does not support is rejected. An operator can opt into
+/// accepting such a document by enabling `ephemeral_clients.ignore_unknown_auth_flows`,
+/// which strips the unknown grant types in `Client::ephemeral_from_url` *before* this
+/// validation runs, so the sanitized list passes here.
 #[inline]
 pub fn validate_vec_grant_type(value: &[String]) -> Result<(), ValidationError> {
-    let mut err = None;
-    value.iter().for_each(|v| {
+    for v in value {
         if !RE_GRANT_TYPES.is_match(v) {
-            err = Some("authorization_code|client_credentials|password|refresh_token");
+            return Err(ValidationError::new(
+                "^(authorization_code|client_credentials|urn:ietf:params:oauth:grant-type:device_code|password|refresh_token)$",
+            ));
         }
-    });
-    if let Some(e) = err {
-        return Err(ValidationError::new(e));
     }
     Ok(())
 }
@@ -223,6 +229,33 @@ mod tests {
         assert!(validate_claims(&json!(true)).is_err());
         assert!(validate_claims(&json!(["a", "b"])).is_err());
         assert!(validate_claims(&serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn grant_type_validators_reject_unknown_by_default() {
+        // A spec-valid client (e.g. claude.ai) may advertise grant types Rauthy does not
+        // implement. By default BOTH validators reject them - DCR/admin/bootstrap store the
+        // list verbatim, and the ephemeral path only accepts unknown grants after they are
+        // stripped upstream (gated by `ephemeral_clients.ignore_unknown_auth_flows`).
+        let with_unknown = [
+            "authorization_code",
+            "refresh_token",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        ]
+        .map(String::from);
+        assert!(validate_vec_grant_types(&with_unknown).is_err());
+        assert!(validate_vec_grant_type(&with_unknown).is_err());
+
+        // An all-supported list passes both validators.
+        let all_known = ["authorization_code", "refresh_token"].map(String::from);
+        assert!(validate_vec_grant_types(&all_known).is_ok());
+        assert!(validate_vec_grant_type(&all_known).is_ok());
+
+        // The plural validator rejects an explicitly empty list; the singular has no
+        // empty-check (an ephemeral document may legitimately omit grant_types).
+        let empty: [String; 0] = [];
+        assert!(validate_vec_grant_types(&empty).is_err());
+        assert!(validate_vec_grant_type(&empty).is_ok());
     }
 
     #[test]
