@@ -1342,40 +1342,47 @@ impl Client {
         code_challenge: &Option<String>,
         code_challenge_method: &Option<String>,
     ) -> Result<(), ErrorResponse> {
-        if let Some(methods_allowed) = &self.challenge {
-            if code_challenge.is_none() {
+        // A client with `challenge` set *requires* PKCE. When it is `None`, PKCE is not
+        // required, but the client MAY still use it: OAuth 2.1 and RFC 7636 recommend PKCE
+        // for every client, including confidential ones, as defense in depth. A challenge
+        // that is accepted here is stored on the auth code and verified at the token
+        // endpoint regardless of the client type, so allowing it only adds protection and
+        // never relaxes a confidential client's secret requirement.
+        if code_challenge.is_none() {
+            return if self.challenge.is_some() {
                 trace!("'code_challenge' is missing");
-                return Err(ErrorResponse::new(
-                    ErrorResponseType::BadRequest,
-                    "'code_challenge' is missing",
-                ));
-            }
-
-            let Some(method) = code_challenge_method else {
-                trace!("'code_challenge_method' is missing");
-                return Err(ErrorResponse::new(
-                    ErrorResponseType::BadRequest,
-                    "'code_challenge_method' is missing",
-                ));
-            };
-
-            if methods_allowed.contains(method) {
-                Ok(())
-            } else {
-                trace!("given code_challenge_method is not allowed");
                 Err(ErrorResponse::new(
                     ErrorResponseType::BadRequest,
-                    format!("code_challenge_method '{method}' is not allowed"),
+                    "'code_challenge' is missing",
                 ))
-            }
-        } else if code_challenge.is_some() || code_challenge_method.is_some() {
-            trace!("'code_challenge' not enabled for this client");
+            } else {
+                Ok(())
+            };
+        }
+
+        // A `code_challenge` was given -> it must be accompanied by a valid method.
+        let Some(method) = code_challenge_method else {
+            trace!("'code_challenge_method' is missing");
+            return Err(ErrorResponse::new(
+                ErrorResponseType::BadRequest,
+                "'code_challenge_method' is missing",
+            ));
+        };
+
+        // For a PKCE-required client, honor its configured method allow-list. For any other
+        // client, accept the standard PKCE methods; the verifier is still checked at /token.
+        let method_ok = match &self.challenge {
+            Some(methods_allowed) => methods_allowed.contains(method),
+            None => method == "S256" || method == "plain",
+        };
+        if method_ok {
+            Ok(())
+        } else {
+            trace!("given code_challenge_method is not allowed");
             Err(ErrorResponse::new(
                 ErrorResponseType::BadRequest,
-                "'code_challenge' not enabled for this client",
+                format!("code_challenge_method '{method}' is not allowed"),
             ))
-        } else {
-            Ok(())
         }
     }
 
@@ -1950,6 +1957,46 @@ mod tests {
         let mut only_unknown = vec!["urn:ietf:params:oauth:grant-type:jwt-bearer".to_string()];
         retain_supported_grant_types(&mut only_unknown);
         assert!(only_unknown.is_empty());
+    }
+
+    #[test]
+    fn validate_code_challenge_optional_for_non_pkce_clients() {
+        // A client with `challenge: None` (e.g. a confidential client registered via DCR)
+        // does not *require* PKCE, but per OAuth 2.1 / RFC 7636 it may still use it. Before
+        // the fix, any `code_challenge` from such a client was rejected with
+        // "'code_challenge' not enabled for this client" - which is exactly how claude.ai's
+        // confidential (client_secret_post) MCP client, that also sends PKCE, was blocked.
+        let mut client = Client {
+            confidential: true,
+            challenge: None,
+            ..Default::default()
+        };
+
+        let s256 = Some("S256".to_string());
+        let plain = Some("plain".to_string());
+        let ch = Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string());
+
+        // no PKCE at all -> fine, it is not required for this client
+        assert!(client.validate_code_challenge(&None, &None).is_ok());
+        // opts into PKCE with a valid method -> accepted (was rejected before the fix)
+        assert!(client.validate_code_challenge(&ch, &s256).is_ok());
+        assert!(client.validate_code_challenge(&ch, &plain).is_ok());
+        // a challenge without a method, or with an unknown method, is still rejected
+        assert!(client.validate_code_challenge(&ch, &None).is_err());
+        assert!(
+            client
+                .validate_code_challenge(&ch, &Some("bogus".to_string()))
+                .is_err()
+        );
+
+        // A PKCE-required client (challenge set) keeps the strict behaviour unchanged.
+        client.challenge = Some("S256".to_string());
+        // required but missing -> error
+        assert!(client.validate_code_challenge(&None, &None).is_err());
+        // present and allowed -> ok
+        assert!(client.validate_code_challenge(&ch, &s256).is_ok());
+        // present but not in the configured allow-list -> error
+        assert!(client.validate_code_challenge(&ch, &plain).is_err());
     }
 
     #[test]
