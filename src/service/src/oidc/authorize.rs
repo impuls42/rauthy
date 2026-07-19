@@ -258,6 +258,7 @@ pub(crate) async fn finish_authorize(
         data.nonce,
         scopes,
         data.resource,
+        session.auth_time,
         code_lifetime,
     );
     code.save(code_lifetime).await?;

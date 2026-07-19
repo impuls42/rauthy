@@ -278,6 +278,8 @@ pub async fn migrate_from_sqlite(db_from: &str) -> Result<(), ErrorResponse> {
                 exp: row.get("exp")?,
                 last_seen: row.get("last_seen")?,
                 remote_ip: row.get("remote_ip")?,
+                // tolerate a source DB that predates the `auth_time` column
+                auth_time: row.get("auth_time").ok().flatten(),
             })
         })?
         .map(|r| r.unwrap())
