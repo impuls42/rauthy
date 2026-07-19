@@ -25,6 +25,11 @@ pub struct AuthCode {
     /// No `serde` skip/default attributes here: auth codes are cached with bincode (a
     /// positional, non-self-describing format), so the field must always be present.
     pub resource: Option<String>,
+    /// Unix timestamp of the actual user authentication (from the session), carried through
+    /// so the token exchange sets `auth_time` to when the user really authenticated rather
+    /// than the mutable `user.last_login`. Same bincode caveat as `resource` above: no serde
+    /// skip/default. `None` falls back to `user.last_login` at the token endpoint.
+    pub auth_time: Option<i64>,
 }
 
 impl Debug for AuthCode {
@@ -88,6 +93,7 @@ impl AuthCode {
         nonce: Option<String>,
         scopes: Vec<String>,
         resource: Option<String>,
+        auth_time: Option<i64>,
         lifetime_secs: i32,
     ) -> Self {
         let id = get_rand(64);
@@ -105,6 +111,7 @@ impl AuthCode {
             nonce,
             scopes,
             resource,
+            auth_time,
         }
     }
 
@@ -168,5 +175,44 @@ impl AuthCodeToSAwait {
     #[inline]
     pub fn generate_code() -> String {
         get_rand(64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthCode;
+
+    #[test]
+    fn auth_code_carries_auth_time() {
+        // #1654: the session-fixed auth_time is carried verbatim onto the auth code so the
+        // token exchange can use it instead of the mutable `user.last_login`.
+        let code = AuthCode::new(
+            "user".to_string(),
+            "client".to_string(),
+            Some("session".to_string()),
+            None,
+            None,
+            None,
+            vec!["openid".to_string()],
+            None,
+            Some(1_700_000_000),
+            60,
+        );
+        assert_eq!(code.auth_time, Some(1_700_000_000));
+
+        // A legacy/absent value is carried through as-is (falls back at the token endpoint).
+        let code_none = AuthCode::new(
+            "user".to_string(),
+            "client".to_string(),
+            None,
+            None,
+            None,
+            None,
+            vec!["openid".to_string()],
+            None,
+            None,
+            60,
+        );
+        assert_eq!(code_none.auth_time, None);
     }
 }

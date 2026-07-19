@@ -172,7 +172,7 @@ pub async fn grant_type_authorization_code(
     let token_set = TokenSet::from_user(
         &user,
         &client,
-        AuthTime::given(user.last_login.unwrap_or_else(|| Utc::now().timestamp())),
+        AuthTime::given(resolve_auth_time(code.auth_time, user.last_login)),
         dpop_fingerprint,
         code.nonce.clone().map(TokenNonce),
         Some(TokenScopes(code.scopes.join(" "))),
@@ -209,4 +209,43 @@ pub async fn grant_type_authorization_code(
     // No location check here, this is done in `POST /authorize` already
 
     Ok((token_set, headers))
+}
+
+/// Resolves the OIDC `auth_time` for an `authorization_code` exchange.
+///
+/// Prefers the session-fixed authentication time carried on the auth code (`code_auth_time`),
+/// falling back to `user.last_login` only for legacy sessions created before the session
+/// `auth_time` column existed, and to "now" as a last resort. `user.last_login` is bumped by
+/// token refreshes and any login across the user's sessions, so preferring the session value
+/// keeps `auth_time` at the moment the user actually authenticated for *this* session and
+/// prevents it reporting a fresher time than really happened (see #1654).
+fn resolve_auth_time(code_auth_time: Option<i64>, last_login: Option<i64>) -> i64 {
+    code_auth_time
+        .or(last_login)
+        .unwrap_or_else(|| Utc::now().timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_auth_time;
+
+    #[test]
+    fn auth_time_prefers_session_over_last_login() {
+        // #1654: the session-fixed value wins over the mutable `user.last_login`, even when
+        // `last_login` is more recent (e.g. bumped by a token refresh).
+        let session_auth_time = 1_000;
+        let bumped_last_login = 2_000;
+        assert_eq!(
+            resolve_auth_time(Some(session_auth_time), Some(bumped_last_login)),
+            session_auth_time,
+        );
+
+        // Legacy sessions (no `auth_time`) fall back to `last_login`.
+        assert_eq!(resolve_auth_time(None, Some(bumped_last_login)), bumped_last_login);
+
+        // With neither available it degrades to ~now rather than panicking.
+        let now = chrono::Utc::now().timestamp();
+        let resolved = resolve_auth_time(None, None);
+        assert!((resolved - now).abs() <= 2);
+    }
 }

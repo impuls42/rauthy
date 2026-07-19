@@ -38,6 +38,12 @@ pub struct Session {
     pub exp: i64,
     pub last_seen: i64,
     pub remote_ip: Option<String>,
+    /// Unix timestamp of the actual user authentication that established this session.
+    /// Fixed for the session's lifetime and used as the OIDC `auth_time` claim, so a token
+    /// refresh (which bumps `user.last_login`) or a silent re-auth cannot report a fresher
+    /// authentication than really happened. `None` for sessions created before this column
+    /// existed; the token path then falls back to `user.last_login`.
+    pub auth_time: Option<i64>,
 }
 
 impl Debug for Session {
@@ -45,7 +51,7 @@ impl Debug for Session {
         write!(
             f,
             "Session {{ id: {}(...), csrf_token: {}(...), user_id: {:?}, roles: {:?}, groups: {:?}, \
-        is_mfa: {}, state: {}, exp: {}, last_seen: {}, remote_ip: {:?} }}",
+        is_mfa: {}, state: {}, exp: {}, last_seen: {}, remote_ip: {:?}, auth_time: {:?} }}",
             &self.id[..5],
             &self.csrf_token[..5],
             self.user_id,
@@ -55,7 +61,8 @@ impl Debug for Session {
             self.state.as_str(),
             self.exp,
             self.last_seen,
-            self.remote_ip
+            self.remote_ip,
+            self.auth_time
         )
     }
 }
@@ -366,11 +373,11 @@ OFFSET $3"#;
 
         let sql = r#"
 INSERT INTO
-sessions (id, csrf_token, user_id, roles, groups, is_mfa, state, exp, last_seen, remote_ip)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+sessions (id, csrf_token, user_id, roles, groups, is_mfa, state, exp, last_seen, remote_ip, auth_time)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT(id) DO UPDATE
 SET user_id = $3, roles = $4, groups = $5, is_mfa = $6, state = $7, exp = $8, last_seen = $9,
-    remote_ip = $10"#;
+    remote_ip = $10, auth_time = $11"#;
 
         if is_hiqlite() {
             DB::hql()
@@ -386,7 +393,8 @@ SET user_id = $3, roles = $4, groups = $5, is_mfa = $6, state = $7, exp = $8, la
                         state_str,
                         self.exp,
                         self.last_seen,
-                        &self.remote_ip
+                        &self.remote_ip,
+                        self.auth_time
                     ),
                 )
                 .await?;
@@ -404,6 +412,7 @@ SET user_id = $3, roles = $4, groups = $5, is_mfa = $6, state = $7, exp = $8, la
                     &self.exp,
                     &self.last_seen,
                     &self.remote_ip,
+                    &self.auth_time,
                 ],
             )
             .await?;
@@ -456,6 +465,14 @@ SET user_id = $3, roles = $4, groups = $5, is_mfa = $6, state = $7, exp = $8, la
     #[inline]
     pub async fn set_authenticated(&mut self, user: &User) -> Result<(), ErrorResponse> {
         self.last_seen = Utc::now().timestamp();
+        // Stamp the authentication time ONLY on the first authentication of this session (not
+        // at `Session::new`, which is the pre-auth `Init` session). It then stays fixed and
+        // drives OIDC `auth_time`. This function is also reached on a silent re-auth
+        // (`/authorize/refresh` -> `finish_authorize`), so guarding on `is_none()` is what keeps
+        // a returning-user login from advancing `auth_time` (see #1654).
+        if self.auth_time.is_none() {
+            self.auth_time = Some(self.last_seen);
+        }
         self.state = SessionState::Auth;
         self.validate_user_expiry(user)?;
         self.user_id = Some(user.id.clone());
@@ -486,6 +503,9 @@ impl Session {
                 .timestamp(),
             last_seen: now.timestamp(),
             remote_ip: remote_ip.map(|ip| ip.to_string()),
+            // `Init` session, not yet authenticated - `auth_time` is stamped in
+            // `set_authenticated` once the user actually authenticates.
+            auth_time: None,
         }
     }
 
@@ -532,6 +552,8 @@ impl Session {
             exp,
             last_seen: now.timestamp(),
             remote_ip,
+            // Init session; `auth_time` is stamped in `set_authenticated` (matches `new`).
+            auth_time: None,
         })
     }
 
@@ -786,6 +808,16 @@ mod tests {
     use rauthy_error::ErrorResponse;
     use std::net::IpAddr;
     use std::str::FromStr;
+
+    #[test]
+    fn new_session_has_no_auth_time() {
+        // #1654: a fresh `Init` session is not yet authenticated, so it carries no
+        // `auth_time`. It is stamped later in `set_authenticated` at the actual
+        // authentication, and stays fixed from then on (a silent re-auth does not restamp it).
+        let s = Session::new(3600, None);
+        assert_eq!(s.state, SessionState::Init);
+        assert_eq!(s.auth_time, None);
+    }
 
     #[test]
     fn test_session_validation() -> Result<(), ErrorResponse> {
